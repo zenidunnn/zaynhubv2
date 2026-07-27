@@ -1,9 +1,10 @@
 --[[
     ZAYN PANEL — Full WindUI Version
     Porting lengkap dari Rayfield Panel ke WindUI dengan seluruh fitur
-    (Movement, Checkpoint, Players, Mining Gunung, Developer, Info)
+    (Movement, Checkpoint, Players, Mining Gunung, Miscellaneous, Developer, Info)
     + Boulders Highlight Filter & Force Transparency = 0
-    + Custom Keybind Toggle Menu UI.
+    + Custom Keybind Toggle Menu UI & Auto Clicker
+    + Dedicated Miscellaneous Tab.
 ]]
 
 local Players = game:GetService("Players")
@@ -11,6 +12,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ProximityPromptService = game:GetService("ProximityPromptService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -40,9 +42,9 @@ _G.AdminPanelCleanup = function()
         if _G.AdminPanelStopNoclip then _G.AdminPanelStopNoclip() end
         if _G.AdminPanelStopESP then _G.AdminPanelStopESP() end
         if _G.AdminPanelClearBoulders then _G.AdminPanelClearBoulders() end
+        if _G.AdminPanelStopAutoClicker then _G.AdminPanelStopAutoClicker() end
     end)
 
-    -- Menutup Window lama agar tidak duplikat saat dire-execute
     pcall(function()
         local oldWindow = _G.AdminPanelWindow
         if oldWindow then
@@ -52,7 +54,6 @@ _G.AdminPanelCleanup = function()
         end
     end)
 
-    -- Membersihkan ScreenGui WindUI dari CoreGui/PlayerGui
     pcall(function()
         local containers = { game:GetService("CoreGui") }
         if LocalPlayer:FindFirstChild("PlayerGui") then
@@ -158,6 +159,13 @@ local FlyBodyGyro = nil
 local InfiniteJumpConnection = nil
 local NoclipConnection = nil
 
+-- Fitur Ultra Auto Clicker
+local autoClickerEnabled = false
+local autoClickerClicksPerFrame = 5
+local autoClickerLoop = nil
+local autoClickerKeybind = nil
+local AutoClickerToggleRef = nil
+
 -- Fitur Mining
 local turboDigEnabled = false
 local turboDigLoop = nil
@@ -169,7 +177,7 @@ local autoCollectLoop = nil
 local autoCollectKeybind = nil
 local AutoCollectToggleRef = nil
 
--- Fitur Boulder Highlight Filtered + Force Visibility
+-- Fitur Boulder Highlight
 local voltiteHighlightEnabled = false
 local voltiteHighlightCache = {}
 local voltiteRenderLoop = nil
@@ -213,7 +221,46 @@ local function GetNearestBoulderPosition()
 end
 
 ----------------------------------------------------
--- BOULDERS HIGHLIGHT (FORCE TRANSPARENCY = 0 & PEEKED)
+-- ULTRA AUTO CLICKER LOGIC
+----------------------------------------------------
+
+local function toggleAutoClicker(state)
+    autoClickerEnabled = state
+
+    if autoClickerLoop then
+        autoClickerLoop:Disconnect()
+        autoClickerLoop = nil
+    end
+
+    if autoClickerEnabled then
+        autoClickerLoop = track(RunService.RenderStepped:Connect(function()
+            local mousePos = UserInputService:GetMouseLocation()
+            for i = 1, autoClickerClicksPerFrame do
+                VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, true, game, 1)
+                VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, false, game, 1)
+            end
+        end))
+    end
+end
+
+_G.AdminPanelStopAutoClicker = function()
+    toggleAutoClicker(false)
+end
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if autoClickerKeybind and input.KeyCode == autoClickerKeybind then
+        local newState = not autoClickerEnabled
+        toggleAutoClicker(newState)
+        if AutoClickerToggleRef and AutoClickerToggleRef.Set then
+            AutoClickerToggleRef:Set(newState)
+        end
+    end
+end))
+
+----------------------------------------------------
+-- BOULDERS HIGHLIGHT
 ----------------------------------------------------
 
 local function ClearVoltiteHighlight()
@@ -224,7 +271,6 @@ local function ClearVoltiteHighlight()
 end
 _G.AdminPanelClearBoulders = ClearVoltiteHighlight
 
--- Fungsi untuk memaksa seluruh part di dalam boulder menjadi kelihat / Transparency = 0
 local function ForceMakeBoulderVisible(boulder)
     if not boulder then return end
 
@@ -256,7 +302,6 @@ voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
         
         for _, obj in ipairs(allBoulders) do
             if obj:IsA("Model") or obj:IsA("BasePart") then
-                -- Paksa transparansi part boulder jadi 0 supaya terlihat
                 ForceMakeBoulderVisible(obj)
 
                 activeObjects[obj] = true
@@ -266,7 +311,6 @@ voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
                     hl.Name = "BouldersHighlight"
                     hl.Adornee = obj
                     
-                    -- Peeked / Chams (Terlihat menembus dinding)
                     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 
                     hl.FillColor = Color3.fromRGB(0, 255, 255)
@@ -281,7 +325,6 @@ voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
             end
         end
 
-        -- Hapus highlight jika boulder hancur/hilang dari workspace
         for obj, hl in pairs(voltiteHighlightCache) do
             if not activeObjects[obj] or not obj.Parent then
                 pcall(function() hl:Destroy() end)
@@ -382,6 +425,8 @@ end))
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
     if gameProcessedEvent then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    
     if autoCollectKeybind and input.KeyCode == autoCollectKeybind then
         local newState = not autoCollectEnabled
         toggleAutoCollect(newState)
@@ -676,7 +721,6 @@ local MainTab = Window:Tab({ Title = "Main", Icon = "house" })
 
 local KEY_OPTIONS = {"None", "F", "G", "R", "T", "Y", "Z", "X", "C", "V", "B"}
 
--- Keybind untuk Buka/Tutup Menu GUI
 registerDropdown(MainTab:Dropdown({
     Title = "Toggle UI Keybind",
     Values = KEY_OPTIONS,
@@ -686,7 +730,6 @@ registerDropdown(MainTab:Dropdown({
     end
 }))
 
--- Keybind Terbang (Fly)
 registerDropdown(MainTab:Dropdown({
     Title = "Fly Keybind",
     Values = KEY_OPTIONS,
@@ -956,6 +999,38 @@ MountainTab:Toggle({
                 end
             end))
         end
+    end
+})
+
+----------------------------------------------------
+-- MISCELLANEOUS TAB (TAB BARU)
+----------------------------------------------------
+
+local MiscTab = Window:Tab({ Title = "Miscellaneous", Icon = "list" })
+
+registerDropdown(MiscTab:Dropdown({
+    Title = "⚡ Auto Clicker Keybind",
+    Values = KEY_OPTIONS,
+    Value = "None",
+    Callback = function(keyName)
+        autoClickerKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+}))
+
+AutoClickerToggleRef = MiscTab:Toggle({
+    Title = "🖱️ Ultra Auto Clicker",
+    Value = false,
+    Callback = function(Value)
+        toggleAutoClicker(Value)
+    end
+})
+
+MiscTab:Slider({
+    Title = "🔥 Clicks Per Frame (Kecepatan Click)",
+    Step = 1,
+    Value = { Min = 1, Max = 50, Default = autoClickerClicksPerFrame },
+    Callback = function(v)
+        autoClickerClicksPerFrame = v
     end
 })
 
