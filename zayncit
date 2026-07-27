@@ -1,1 +1,995 @@
-https://raw.githubusercontent.com/zenidunnn/zaynhubv2/refs/heads/main/zaynlua
+--[[
+    ZAYN PANEL — Full WindUI Version
+    Porting lengkap dari Rayfield Panel ke WindUI dengan seluruh fitur
+    (Movement, Checkpoint, Players, Mining Gunung, Developer, Info)
+    + Boulders Highlight Filter & Force Transparency = 0
+    + Custom Keybind Toggle Menu UI.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local LocalPlayer = Players.LocalPlayer
+
+----------------------------------------------------
+-- CLEANUP GUARD
+----------------------------------------------------
+
+if _G.AdminPanelCleanup then
+    pcall(_G.AdminPanelCleanup)
+end
+
+local ActiveConnections = {}
+
+local function track(connection)
+    table.insert(ActiveConnections, connection)
+    return connection
+end
+
+_G.AdminPanelCleanup = function()
+    for _, conn in ipairs(ActiveConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    ActiveConnections = {}
+
+    pcall(function()
+        if _G.AdminPanelStopFly then _G.AdminPanelStopFly() end
+        if _G.AdminPanelStopNoclip then _G.AdminPanelStopNoclip() end
+        if _G.AdminPanelStopESP then _G.AdminPanelStopESP() end
+        if _G.AdminPanelClearBoulders then _G.AdminPanelClearBoulders() end
+    end)
+
+    -- Menutup Window lama agar tidak duplikat saat dire-execute
+    pcall(function()
+        local oldWindow = _G.AdminPanelWindow
+        if oldWindow then
+            local closed = pcall(function() oldWindow:Destroy() end)
+            if not closed then closed = pcall(function() oldWindow:Close() end) end
+            if not closed then closed = pcall(function() oldWindow:Unload() end) end
+        end
+    end)
+
+    -- Membersihkan ScreenGui WindUI dari CoreGui/PlayerGui
+    pcall(function()
+        local containers = { game:GetService("CoreGui") }
+        if LocalPlayer:FindFirstChild("PlayerGui") then
+            table.insert(containers, LocalPlayer.PlayerGui)
+        end
+        for _, container in ipairs(containers) do
+            for _, gui in ipairs(container:GetChildren()) do
+                if gui:IsA("ScreenGui") and gui.Name:lower():find("windui") then
+                    gui:Destroy()
+                end
+            end
+        end
+    end)
+end
+
+----------------------------------------------------
+-- WINDUI SETUP
+----------------------------------------------------
+
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+_G.AdminPanelWindUI = WindUI
+
+local Window = WindUI:CreateWindow({
+    Title = "Zayn Panel",
+    Icon = "rocket",
+    Author = "by Zayn",
+    Theme = "Dark",
+})
+_G.AdminPanelWindow = Window
+
+WindUI:Notify({
+    Title = "Admin Panel",
+    Content = "GUI Loaded Successfully!",
+    Duration = 5,
+})
+
+----------------------------------------------------
+-- TOGGLE PANEL KEYBIND & DROPDOWN PROTECT
+----------------------------------------------------
+
+local AllDropdowns = {}
+local function registerDropdown(dropdown)
+    table.insert(AllDropdowns, dropdown)
+    return dropdown
+end
+
+local function closeAllDropdowns()
+    for _, dropdown in ipairs(AllDropdowns) do
+        pcall(function() dropdown:Close() end)
+    end
+end
+
+local function toggleWindowVisibility()
+    closeAllDropdowns()
+
+    local ok = pcall(function() Window:Toggle() end)
+    if not ok then
+        ok = pcall(function() Window:ToggleVisibility() end)
+    end
+    if not ok then
+        pcall(function()
+            if Window.Visible then
+                Window:Close()
+            else
+                Window:Open()
+            end
+        end)
+    end
+end
+
+local ToggleUIKeybind = Enum.KeyCode.R
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if ToggleUIKeybind and input.KeyCode == ToggleUIKeybind then
+        toggleWindowVisibility()
+    end
+end))
+
+----------------------------------------------------
+-- STATE & REMOTES
+----------------------------------------------------
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 2)
+local DigEvent = Remotes and Remotes:WaitForChild("DigRequest", 2) or nil
+
+local FlyEnabled = false
+local FlySpeed = 50
+local WalkSpeedValue = 16
+local JumpPowerValue = 50
+local InfiniteJumpEnabled = false
+local NoclipEnabled = false
+local FlyKeybind = nil
+local CheckpointSlots = {}
+local AutoTeleportOnRespawn = false
+local AutoTeleportSlot = nil
+local ESPEnabled = false
+
+local FlyConnection = nil
+local FlyBodyVelocity = nil
+local FlyBodyGyro = nil
+local InfiniteJumpConnection = nil
+local NoclipConnection = nil
+
+-- Fitur Mining
+local turboDigEnabled = false
+local turboDigLoop = nil
+local autoAimBoulder = false
+local autoDigNoClick = false
+local instantPromptEnabled = false
+local autoCollectEnabled = false
+local autoCollectLoop = nil
+local autoCollectKeybind = nil
+local AutoCollectToggleRef = nil
+
+-- Fitur Boulder Highlight Filtered + Force Visibility
+local voltiteHighlightEnabled = false
+local voltiteHighlightCache = {}
+local voltiteRenderLoop = nil
+
+local MaxCollectDistance = 12
+
+----------------------------------------------------
+-- HELPER FUNCTIONS
+----------------------------------------------------
+
+local function getCharacterParts()
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local humanoid = character:WaitForChild("Humanoid")
+    local rootPart = character:WaitForChild("HumanoidRootPart")
+    return character, humanoid, rootPart
+end
+
+local function GetNearestBoulderPosition()
+    local targetPath = workspace:FindFirstChild("MountainDecorations")
+    targetPath = targetPath and targetPath:FindFirstChild("Boulders")
+    if not targetPath then return nil end
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local nearestPos = nil
+    local shortestDist = 50
+
+    for _, obj in ipairs(targetPath:GetChildren()) do
+        if obj:IsA("Model") or obj:IsA("BasePart") then
+            local pos = obj:IsA("Model") and (obj.PrimaryPart and obj.PrimaryPart.Position or obj:GetPivot().Position) or obj.Position
+            local dist = (hrp.Position - pos).Magnitude
+            if dist < shortestDist then
+                shortestDist = dist
+                nearestPos = pos
+            end
+        end
+    end
+    return nearestPos
+end
+
+----------------------------------------------------
+-- BOULDERS HIGHLIGHT (FORCE TRANSPARENCY = 0 & PEEKED)
+----------------------------------------------------
+
+local function ClearVoltiteHighlight()
+    for obj, hl in pairs(voltiteHighlightCache) do
+        pcall(function() hl:Destroy() end)
+    end
+    table.clear(voltiteHighlightCache)
+end
+_G.AdminPanelClearBoulders = ClearVoltiteHighlight
+
+-- Fungsi untuk memaksa seluruh part di dalam boulder menjadi kelihat / Transparency = 0
+local function ForceMakeBoulderVisible(boulder)
+    if not boulder then return end
+
+    if boulder:IsA("BasePart") then
+        boulder.Transparency = 0
+    elseif boulder:IsA("Model") then
+        for _, child in ipairs(boulder:GetDescendants()) do
+            if child:IsA("BasePart") then
+                child.Transparency = 0
+            end
+        end
+    end
+end
+
+voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
+    if not voltiteHighlightEnabled then return end
+    
+    local success, err = pcall(function()
+        local targetPath = workspace:FindFirstChild("MountainDecorations")
+        targetPath = targetPath and targetPath:FindFirstChild("Boulders")
+        
+        if not targetPath then 
+            ClearVoltiteHighlight()
+            return 
+        end
+        
+        local allBoulders = targetPath:GetChildren()
+        local activeObjects = {}
+        
+        for _, obj in ipairs(allBoulders) do
+            if obj:IsA("Model") or obj:IsA("BasePart") then
+                -- Paksa transparansi part boulder jadi 0 supaya terlihat
+                ForceMakeBoulderVisible(obj)
+
+                activeObjects[obj] = true
+
+                if not voltiteHighlightCache[obj] then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "BouldersHighlight"
+                    hl.Adornee = obj
+                    
+                    -- Peeked / Chams (Terlihat menembus dinding)
+                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+
+                    hl.FillColor = Color3.fromRGB(0, 255, 255)
+                    hl.FillTransparency = 0.35
+                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    hl.OutlineTransparency = 0
+
+                    hl.Parent = game:GetService("CoreGui")
+
+                    voltiteHighlightCache[obj] = hl
+                end
+            end
+        end
+
+        -- Hapus highlight jika boulder hancur/hilang dari workspace
+        for obj, hl in pairs(voltiteHighlightCache) do
+            if not activeObjects[obj] or not obj.Parent then
+                pcall(function() hl:Destroy() end)
+                voltiteHighlightCache[obj] = nil
+            end
+        end
+    end)
+    
+    if not success then
+        ClearVoltiteHighlight()
+    end
+end))
+
+----------------------------------------------------
+-- INSTANT PROMPT & AUTO COLLECT LOGIC
+----------------------------------------------------
+
+local function triggerPrompt(prompt)
+    if not prompt or not prompt.Enabled then return end
+    
+    local character = LocalPlayer.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local parentPart = prompt.Parent
+    local promptPos = parentPart and (parentPart:IsA("BasePart") and parentPart.Position or parentPart:IsA("Model") and parentPart:GetPivot().Position)
+
+    if promptPos then
+        local distance = (hrp.Position - promptPos).Magnitude
+        if distance <= MaxCollectDistance then
+            prompt.HoldDuration = 0
+            if fireproximityprompt then
+                fireproximityprompt(prompt)
+            else
+                pcall(function()
+                    prompt:InputHoldBegan()
+                    prompt:InputHoldEnd()
+                end)
+            end
+        end
+    end
+end
+
+local function toggleAutoCollect(state)
+    autoCollectEnabled = state
+
+    if autoCollectLoop then
+        autoCollectLoop:Disconnect()
+        autoCollectLoop = nil
+    end
+
+    if autoCollectEnabled then
+        autoCollectLoop = track(RunService.Heartbeat:Connect(function()
+            local character = LocalPlayer.Character
+            local hrp = character and character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+
+            local overlapParams = OverlapParams.new()
+            overlapParams.FilterType = Enum.RaycastFilterType.Include
+            overlapParams.FilterDescendantsInstances = {workspace}
+
+            local nearbyParts = workspace:GetPartBoundsInRadius(hrp.Position, MaxCollectDistance, overlapParams)
+
+            for _, part in ipairs(nearbyParts) do
+                if not autoCollectEnabled then break end
+                
+                for _, child in ipairs(part:GetChildren()) do
+                    if child:IsA("ProximityPrompt") and child.Enabled then
+                        triggerPrompt(child)
+                    end
+                end
+            end
+        end))
+    end
+end
+
+track(ProximityPromptService.PromptShown:Connect(function(prompt)
+    if instantPromptEnabled or autoCollectEnabled then
+        local character = LocalPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+
+        local parentPart = prompt.Parent
+        local promptPos = parentPart and (parentPart:IsA("BasePart") and parentPart.Position or parentPart:IsA("Model") and parentPart:GetPivot().Position)
+
+        if promptPos and (hrp.Position - promptPos).Magnitude <= MaxCollectDistance then
+            prompt.HoldDuration = 0
+            if autoCollectEnabled then
+                triggerPrompt(prompt)
+            end
+        end
+    end
+end))
+
+track(ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt)
+    if instantPromptEnabled or autoCollectEnabled then pcall(function() prompt:InputHoldEnd() end) end
+end))
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    if autoCollectKeybind and input.KeyCode == autoCollectKeybind then
+        local newState = not autoCollectEnabled
+        toggleAutoCollect(newState)
+        if AutoCollectToggleRef and AutoCollectToggleRef.Set then 
+            AutoCollectToggleRef:Set(newState) 
+        end
+    end
+end))
+
+----------------------------------------------------
+-- FLY FUNCTION
+----------------------------------------------------
+
+local function startFly()
+    local character, humanoid, rootPart = getCharacterParts()
+
+    FlyBodyVelocity = Instance.new("BodyVelocity")
+    FlyBodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    FlyBodyVelocity.Velocity = Vector3.new(0, 0, 0)
+    FlyBodyVelocity.Parent = rootPart
+
+    FlyBodyGyro = Instance.new("BodyGyro")
+    FlyBodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    FlyBodyGyro.P = 9000
+    FlyBodyGyro.CFrame = rootPart.CFrame
+    FlyBodyGyro.Parent = rootPart
+
+    humanoid.PlatformStand = true
+
+    FlyConnection = RunService.RenderStepped:Connect(function()
+        local camera = workspace.CurrentCamera
+        local moveDirection = Vector3.new(0, 0, 0)
+        local camCFrame = camera.CFrame
+
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDirection += camCFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDirection -= camCFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDirection -= camCFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDirection += camCFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDirection += Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveDirection -= Vector3.new(0, 1, 0) end
+
+        if moveDirection.Magnitude > 0 then moveDirection = moveDirection.Unit end
+
+        FlyBodyVelocity.Velocity = moveDirection * FlySpeed
+        FlyBodyGyro.CFrame = camCFrame
+    end)
+end
+
+local function stopFly()
+    if FlyConnection then FlyConnection:Disconnect() FlyConnection = nil end
+    if FlyBodyVelocity then FlyBodyVelocity:Destroy() FlyBodyVelocity = nil end
+    if FlyBodyGyro then FlyBodyGyro:Destroy() FlyBodyGyro = nil end
+
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid.PlatformStand = false end
+    end
+end
+
+_G.AdminPanelStopFly = stopFly
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    if FlyEnabled then task.wait(1) startFly() end
+end))
+
+----------------------------------------------------
+-- WALKSPEED / JUMP POWER / INFINITE JUMP / NOCLIP
+----------------------------------------------------
+
+local function applyWalkSpeed(value)
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid.WalkSpeed = value end
+    end
+end
+track(LocalPlayer.CharacterAdded:Connect(function() task.wait(1) applyWalkSpeed(WalkSpeedValue) end))
+
+local function applyJumpPower(value)
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid.UseJumpPower = true humanoid.JumpPower = value end
+    end
+end
+track(LocalPlayer.CharacterAdded:Connect(function() task.wait(1) applyJumpPower(JumpPowerValue) end))
+
+local function startInfiniteJump()
+    if InfiniteJumpConnection then return end
+    InfiniteJumpConnection = UserInputService.JumpRequest:Connect(function()
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end)
+end
+
+local function stopInfiniteJump()
+    if InfiniteJumpConnection then InfiniteJumpConnection:Disconnect() InfiniteJumpConnection = nil end
+end
+
+local function startNoclip()
+    if NoclipConnection then return end
+    NoclipConnection = RunService.Stepped:Connect(function()
+        local character = LocalPlayer.Character
+        if not character then return end
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+        end
+    end)
+end
+
+local function stopNoclip()
+    if NoclipConnection then NoclipConnection:Disconnect() NoclipConnection = nil end
+    local character = LocalPlayer.Character
+    if character then
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then part.CanCollide = true end
+        end
+    end
+end
+_G.AdminPanelStopNoclip = stopNoclip
+
+----------------------------------------------------
+-- CHECKPOINT
+----------------------------------------------------
+
+local function saveCheckpoint(slot)
+    local character = LocalPlayer.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if rootPart then CheckpointSlots[slot] = rootPart.CFrame return true end
+    return false
+end
+
+local function teleportToCheckpoint(slot)
+    if not CheckpointSlots[slot] then
+        WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. slot .. " masih kosong.", Duration = 3 })
+        return
+    end
+    local character = LocalPlayer.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+    if rootPart then rootPart.CFrame = CheckpointSlots[slot] end
+end
+
+local function deleteCheckpoint(slot)
+    CheckpointSlots[slot] = nil
+    if AutoTeleportSlot == slot then AutoTeleportSlot = nil AutoTeleportOnRespawn = false end
+end
+
+track(LocalPlayer.CharacterAdded:Connect(function(character)
+    if AutoTeleportOnRespawn and AutoTeleportSlot and CheckpointSlots[AutoTeleportSlot] then
+        local rootPart = character:WaitForChild("HumanoidRootPart")
+        task.wait(0.5)
+        rootPart.CFrame = CheckpointSlots[AutoTeleportSlot]
+    end
+end))
+
+----------------------------------------------------
+-- ESP LOKAL PLAYER
+----------------------------------------------------
+
+local ESPCache = {}
+
+local function createESP(player)
+    if player == LocalPlayer or ESPCache[player] or not player.Character then return end
+    local character = player.Character
+
+    local highlight = Instance.new("Highlight")
+    highlight.FillColor = Color3.fromRGB(0, 170, 255)
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.OutlineTransparency = 0.2
+    highlight.Parent = character
+
+    local head = character:FindFirstChild("Head")
+    local billboard, renderConnection
+
+    if head then
+        billboard = Instance.new("BillboardGui")
+        billboard.Size = UDim2.new(0, 130, 0, 36)
+        billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+        billboard.AlwaysOnTop = true
+        billboard.Parent = head
+
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 1, 0)
+        frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+        frame.BackgroundTransparency = 0.2
+        frame.BorderSizePixel = 0
+        frame.Parent = billboard
+
+        local frameCorner = Instance.new("UICorner")
+        frameCorner.CornerRadius = UDim.new(0, 6)
+        frameCorner.Parent = frame
+
+        local accentLine = Instance.new("Frame")
+        accentLine.Size = UDim2.new(0, 4, 1, -4)
+        accentLine.Position = UDim2.new(0, 2, 0, 2)
+        accentLine.BackgroundColor3 = Color3.fromRGB(0, 140, 255)
+        accentLine.BorderSizePixel = 0
+        accentLine.Parent = frame
+
+        local lineCorner = Instance.new("UICorner")
+        lineCorner.CornerRadius = UDim.new(0, 2)
+        lineCorner.Parent = accentLine
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(1, -14, 0, 18)
+        nameLabel.Position = UDim2.new(0, 10, 0, 2)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 13
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Text = player.Name
+        nameLabel.Parent = frame
+
+        local infoLabel = Instance.new("TextLabel")
+        infoLabel.Size = UDim2.new(1, -14, 0, 14)
+        infoLabel.Position = UDim2.new(0, 10, 0, 18)
+        infoLabel.BackgroundTransparency = 1
+        infoLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
+        infoLabel.Font = Enum.Font.Gotham
+        infoLabel.TextSize = 10
+        infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+        infoLabel.Text = "0m · Alt: 0m"
+        infoLabel.Parent = frame
+
+        renderConnection = RunService.RenderStepped:Connect(function()
+            local myChar = LocalPlayer.Character
+            local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+            local targetHrp = character and character:FindFirstChild("HumanoidRootPart")
+
+            if myHrp and targetHrp then
+                local distance = math.floor((myHrp.Position - targetHrp.Position).Magnitude)
+                local altitude = math.floor(targetHrp.Position.Y)
+                infoLabel.Text = string.format("%dm  ·  Alt: %dm", distance, altitude)
+            end
+        end)
+    end
+
+    ESPCache[player] = { Highlight = highlight, Billboard = billboard, Connection = renderConnection }
+end
+
+local function removeESP(player)
+    local cache = ESPCache[player]
+    if cache then
+        if cache.Connection then cache.Connection:Disconnect() end
+        if cache.Highlight then cache.Highlight:Destroy() end
+        if cache.Billboard then cache.Billboard:Destroy() end
+        ESPCache[player] = nil
+    end
+end
+
+local function startESP()
+    for _, p in ipairs(Players:GetPlayers()) do createESP(p) end
+end
+
+local function stopESP()
+    for p, _ in pairs(ESPCache) do removeESP(p) end
+end
+
+_G.AdminPanelStopESP = stopESP
+
+local function setupESPTracking(player)
+    if player == LocalPlayer then return end
+    track(player.CharacterAdded:Connect(function()
+        if ESPEnabled then
+            removeESP(player)
+            task.wait(0.5)
+            createESP(player)
+        end
+    end))
+end
+
+for _, p in ipairs(Players:GetPlayers()) do setupESPTracking(p) end
+track(Players.PlayerAdded:Connect(function(player)
+    setupESPTracking(player)
+    if ESPEnabled then
+        player.CharacterAdded:Wait()
+        task.wait(0.5)
+        createESP(player)
+    end
+end))
+track(Players.PlayerRemoving:Connect(removeESP))
+
+----------------------------------------------------
+-- MAIN TAB
+----------------------------------------------------
+
+local MainTab = Window:Tab({ Title = "Main", Icon = "house" })
+
+local KEY_OPTIONS = {"None", "F", "G", "R", "T", "Y", "Z", "X", "C", "V", "B"}
+
+-- Keybind untuk Buka/Tutup Menu GUI
+registerDropdown(MainTab:Dropdown({
+    Title = "Toggle UI Keybind",
+    Values = KEY_OPTIONS,
+    Value = "R",
+    Callback = function(keyName)
+        ToggleUIKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+}))
+
+-- Keybind Terbang (Fly)
+registerDropdown(MainTab:Dropdown({
+    Title = "Fly Keybind",
+    Values = KEY_OPTIONS,
+    Value = "None",
+    Callback = function(keyName)
+        FlyKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+}))
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+    if gameProcessedEvent then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if FlyKeybind and input.KeyCode == FlyKeybind then
+        FlyEnabled = not FlyEnabled
+        if FlyEnabled then startFly() else stopFly() end
+    end
+end))
+
+MainTab:Slider({
+    Title = "Fly Speed",
+    Step = 5,
+    Value = { Min = 10, Max = 1000, Default = FlySpeed },
+    Callback = function(v) FlySpeed = v end
+})
+
+MainTab:Slider({
+    Title = "Walk Speed",
+    Step = 1,
+    Value = { Min = 16, Max = 300, Default = WalkSpeedValue },
+    Callback = function(v) WalkSpeedValue = v applyWalkSpeed(v) end
+})
+
+MainTab:Button({
+    Title = "Reset Walk Speed (16)",
+    Callback = function() WalkSpeedValue = 16 applyWalkSpeed(16) end
+})
+
+MainTab:Slider({
+    Title = "Jump Power",
+    Step = 10,
+    Value = { Min = 0, Max = 300, Default = JumpPowerValue },
+    Callback = function(v) JumpPowerValue = v applyJumpPower(v) end
+})
+
+MainTab:Toggle({
+    Title = "Infinite Jump",
+    Value = false,
+    Callback = function(v) InfiniteJumpEnabled = v if v then startInfiniteJump() else stopInfiniteJump() end end
+})
+
+MainTab:Toggle({
+    Title = "Noclip",
+    Value = false,
+    Callback = function(v) NoclipEnabled = v if v then startNoclip() else stopNoclip() end end
+})
+
+----------------------------------------------------
+-- CHECKPOINT TAB
+----------------------------------------------------
+
+local CheckpointTab = Window:Tab({ Title = "Checkpoint", Icon = "map-pin" })
+
+for i = 1, 3 do
+    CheckpointTab:Button({
+        Title = "💾 Save Slot " .. i,
+        Callback = function()
+            if saveCheckpoint(i) then
+                WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " tersimpan!", Duration = 3 })
+            end
+        end
+    })
+    CheckpointTab:Button({
+        Title = "➡️ Teleport ke Slot " .. i,
+        Callback = function() teleportToCheckpoint(i) end
+    })
+    CheckpointTab:Button({
+        Title = "🗑️ Hapus Slot " .. i,
+        Callback = function()
+            deleteCheckpoint(i)
+            WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " dihapus.", Duration = 3 })
+        end
+    })
+end
+
+registerDropdown(CheckpointTab:Dropdown({
+    Title = "Slot untuk Auto TP Saat Respawn",
+    Values = {"None", "Slot 1", "Slot 2", "Slot 3"},
+    Value = "None",
+    Callback = function(choice)
+        AutoTeleportSlot = (choice == "Slot 1" and 1) or (choice == "Slot 2" and 2) or (choice == "Slot 3" and 3) or nil
+    end
+}))
+
+CheckpointTab:Toggle({
+    Title = "Auto TP ke Slot Saat Respawn",
+    Value = false,
+    Callback = function(v) AutoTeleportOnRespawn = v end
+})
+
+----------------------------------------------------
+-- PLAYERS TAB
+----------------------------------------------------
+
+local PlayersTab = Window:Tab({ Title = "Players", Icon = "users" })
+
+local selectedPlayerName = nil
+local function getOtherPlayerNames()
+    local names = {}
+    for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then table.insert(names, p.Name) end end
+    return names
+end
+
+local PlayerDropdown = registerDropdown(PlayersTab:Dropdown({
+    Title = "Select Player",
+    Values = getOtherPlayerNames(),
+    Callback = function(name) selectedPlayerName = name end
+}))
+
+PlayersTab:Button({
+    Title = "Refresh Player List",
+    Callback = function() PlayerDropdown:Refresh(getOtherPlayerNames()) end
+})
+
+PlayersTab:Button({
+    Title = "Teleport To Player",
+    Callback = function()
+        local targetPlayer = selectedPlayerName and Players:FindFirstChild(selectedPlayerName)
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local targetRoot = targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot and targetRoot then
+            myRoot.CFrame = targetRoot.CFrame + Vector3.new(0, 2, 0)
+        else
+            WindUI:Notify({ Title = "Teleport Failed", Content = "Pilih player & pastikan karakter ada.", Duration = 3 })
+        end
+    end
+})
+
+track(Players.PlayerAdded:Connect(function() task.wait(1) PlayerDropdown:Refresh(getOtherPlayerNames()) end))
+track(Players.PlayerRemoving:Connect(function() task.wait(1) PlayerDropdown:Refresh(getOtherPlayerNames()) end))
+
+PlayersTab:Button({
+    Title = "Tendangan/Pukulan Maut (Hati Hati Bug)", 
+    Callback = function() 
+        pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Natural-Disaster-Survival-the-REAL-drop-kick-206988"))() end)
+    end 
+})
+
+PlayersTab:Toggle({
+    Title = "ESP Player (Custom UI)",
+    Value = false,
+    Callback = function(Value)
+        ESPEnabled = Value
+        if Value then startESP() else stopESP() end
+    end
+})
+
+PlayersTab:Button({
+    Title = "Load Aimbot + ESP", 
+    Callback = function() 
+        pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-Universal-Keyless-Advanced-Aimbot-And-Esp-Gui-90617"))() end)
+    end 
+})
+
+PlayersTab:Button({
+    Title = "All Emote", 
+    Callback = function() 
+        pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-7yd7-I-Emote-Script-48024"))() end)
+    end 
+})
+
+PlayersTab:Button({
+    Title = "Copy Character Script", 
+    Callback = function() 
+        pcall(function() loadstring(game:HttpGet('https://raw.githubusercontent.com/Nearastro/Nearastro/refs/heads/main/00CopyAvaFE.lua'))() end)
+    end 
+})
+
+----------------------------------------------------
+-- MINING GUNUNG TAB
+----------------------------------------------------
+
+local MountainTab = Window:Tab({ Title = "Mining Gunung", Icon = "pickaxe" })
+
+MountainTab:Toggle({
+    Title = "🔮 Boulders Highlight (Chams Only)",
+    Value = false,
+    Callback = function(state)
+        voltiteHighlightEnabled = state
+        if not state then
+            ClearVoltiteHighlight()
+        end
+    end
+})
+
+MountainTab:Toggle({
+    Title = "⚡ Instant Fire Prompt",
+    Value = false,
+    Callback = function(Value)
+        instantPromptEnabled = Value
+    end
+})
+
+registerDropdown(MountainTab:Dropdown({
+    Title = "⚡ Auto Collect Keybind",
+    Values = KEY_OPTIONS,
+    Value = "None",
+    Callback = function(keyName)
+        autoCollectKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+}))
+
+AutoCollectToggleRef = MountainTab:Toggle({
+    Title = "⚡ Fast Auto Collect (Dekat Saja & No Lag)",
+    Value = false,
+    Callback = function(Value)
+        toggleAutoCollect(Value)
+    end
+})
+
+MountainTab:Toggle({
+    Title = "🧲 Auto-Aim Nearest Boulder",
+    Value = false,
+    Callback = function(Value)
+        autoAimBoulder = Value
+    end
+})
+
+MountainTab:Toggle({
+    Title = "🤖 Auto Dig (No Click Required)",
+    Value = false,
+    Callback = function(Value)
+        autoDigNoClick = Value
+    end
+})
+
+MountainTab:Toggle({
+    Title = "🔥 Turbo Dig (Master Switch)",
+    Value = false,
+    Callback = function(Value)
+        turboDigEnabled = Value
+
+        if turboDigLoop then
+            turboDigLoop:Disconnect()
+            turboDigLoop = nil
+        end
+
+        if turboDigEnabled and DigEvent then
+            local fastEvent = DigEvent
+            local fastMouse = LocalPlayer:GetMouse()
+            local fastUis = UserInputService
+            local localPlayer = LocalPlayer
+            local mouseLeft = Enum.UserInputType.MouseButton1
+
+            turboDigLoop = track(RunService.Heartbeat:Connect(function()
+                if autoDigNoClick or fastUis:IsMouseButtonPressed(mouseLeft) then
+                    local character = localPlayer.Character
+                    local currentTool = character and character:FindFirstChildOfClass("Tool")
+
+                    if autoDigNoClick and not currentTool then return end
+
+                    local dynamicItemName = currentTool and currentTool.Name or "Celestial Apex"
+                    local targetPos = autoAimBoulder and GetNearestBoulderPosition() or (fastMouse.Hit and fastMouse.Hit.Position)
+
+                    if targetPos then
+                        fastEvent:FireServer(dynamicItemName, targetPos)
+                    end
+                end
+            end))
+        end
+    end
+})
+
+----------------------------------------------------
+-- DEVELOPER TAB
+----------------------------------------------------
+
+local DevTab = Window:Tab({ Title = "Developer Tab", Icon = "code" })
+
+DevTab:Button({
+    Title = "DarkDex", 
+    Callback = function() 
+        pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/perfectusmim1/darkdex/refs/heads/main/darkdexp"))() end)
+    end 
+})
+
+----------------------------------------------------
+-- INFO TAB
+----------------------------------------------------
+
+local InfoTab = Window:Tab({ Title = "Info", Icon = "info" })
+
+InfoTab:Paragraph({ Title = "About", Desc = "Credits : Zayn Scripter Homies" })
+InfoTab:Paragraph({ Title = "Fly Controls", Desc = "W/A/S/D untuk bergerak, Space untuk naik, Left Ctrl untuk turun. Arah terbang mengikuti arah kamera." })
+InfoTab:Paragraph({ Title = "Bug", Desc = "Hati Hati untuk mengaktifkan fitur Pukulan/Tendangan Maut karena suka bug keybindnya tabrakan !" })
+InfoTab:Paragraph({ Title = "Zayn Love Livy", Desc = "YANG BIKIN SCRIPT INI UDAH PUNYA CEWE NAMANYA LIVYYYYYYYYYY!!!!!!!!!!!!" })
+
+----------------------------------------------------
+-- AUTO SELECT TAB MAIN
+----------------------------------------------------
+
+task.defer(function()
+    local ok = pcall(function() MainTab:Select() end)
+    if not ok then ok = pcall(function() Window:SelectTab(MainTab) end) end
+    if not ok then ok = pcall(function() Window:SetTab(MainTab) end) end
+    if not ok then ok = pcall(function() MainTab:Show() end) end
+end)
