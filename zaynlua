@@ -1,7 +1,8 @@
 --[[
     ZAYN PANEL — Full WindUI Version
     Porting lengkap dari Rayfield Panel ke WindUI dengan seluruh fitur
-    (Movement, Checkpoint, Players, Mining Gunung, Developer, Info).
+    (Movement, Checkpoint, Players, Mining Gunung, Developer, Info)
+    + Boulders Highlight Filter & Force Transparency = 0.
 ]]
 
 local Players = game:GetService("Players")
@@ -37,6 +38,7 @@ _G.AdminPanelCleanup = function()
         if _G.AdminPanelStopFly then _G.AdminPanelStopFly() end
         if _G.AdminPanelStopNoclip then _G.AdminPanelStopNoclip() end
         if _G.AdminPanelStopESP then _G.AdminPanelStopESP() end
+        if _G.AdminPanelClearBoulders then _G.AdminPanelClearBoulders() end
     end)
 
     -- Menutup Window lama agar tidak duplikat saat dire-execute
@@ -166,6 +168,11 @@ local autoCollectLoop = nil
 local autoCollectKeybind = nil
 local AutoCollectToggleRef = nil
 
+-- Fitur Boulder Highlight Filtered + Force Visibility
+local voltiteHighlightEnabled = false
+local voltiteHighlightCache = {}
+local voltiteRenderLoop = nil
+
 local MaxCollectDistance = 12
 
 ----------------------------------------------------
@@ -203,6 +210,89 @@ local function GetNearestBoulderPosition()
     end
     return nearestPos
 end
+
+----------------------------------------------------
+-- BOULDERS HIGHLIGHT (FORCE TRANSPARENCY = 0 & PEEKED)
+----------------------------------------------------
+
+local function ClearVoltiteHighlight()
+    for obj, hl in pairs(voltiteHighlightCache) do
+        pcall(function() hl:Destroy() end)
+    end
+    table.clear(voltiteHighlightCache)
+end
+_G.AdminPanelClearBoulders = ClearVoltiteHighlight
+
+-- Fungsi untuk memaksa seluruh part di dalam boulder menjadi kelihat / Transparency = 0
+local function ForceMakeBoulderVisible(boulder)
+    if not boulder then return end
+
+    if boulder:IsA("BasePart") then
+        boulder.Transparency = 0
+    elseif boulder:IsA("Model") then
+        for _, child in ipairs(boulder:GetDescendants()) do
+            if child:IsA("BasePart") then
+                child.Transparency = 0
+            end
+        end
+    end
+end
+
+voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
+    if not voltiteHighlightEnabled then return end
+    
+    local success, err = pcall(function()
+        local targetPath = workspace:FindFirstChild("MountainDecorations")
+        targetPath = targetPath and targetPath:FindFirstChild("Boulders")
+        
+        if not targetPath then 
+            ClearVoltiteHighlight()
+            return 
+        end
+        
+        local allBoulders = targetPath:GetChildren()
+        local activeObjects = {}
+        
+        for _, obj in ipairs(allBoulders) do
+            if obj:IsA("Model") or obj:IsA("BasePart") then
+                -- Paksa transparansi part boulder jadi 0 supaya terlihat
+                ForceMakeBoulderVisible(obj)
+
+                activeObjects[obj] = true
+
+                if not voltiteHighlightCache[obj] then
+                    local hl = Instance.new("Highlight")
+                    hl.Name = "BouldersHighlight"
+                    hl.Adornee = obj
+                    
+                    -- Peeked / Chams (Terlihat menembus dinding)
+                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+
+                    hl.FillColor = Color3.fromRGB(0, 255, 255)
+                    hl.FillTransparency = 0.35
+                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                    hl.OutlineTransparency = 0
+
+                    hl.Parent = game:GetService("CoreGui")
+
+                    voltiteHighlightCache[obj] = hl
+                end
+            end
+        end
+
+        -- Hapus highlight jika boulder hancur/hilang dari workspace
+        for obj, hl in pairs(voltiteHighlightCache) do
+            if not activeObjects[obj] or not obj.Parent then
+                pcall(function() hl:Destroy() end)
+                voltiteHighlightCache[obj] = nil
+            end
+        end
+    end)
+    
+    if not success then
+        ClearVoltiteHighlight()
+    end
+end))
 
 ----------------------------------------------------
 -- INSTANT PROMPT & AUTO COLLECT LOGIC
@@ -767,6 +857,17 @@ PlayersTab:Button({
 ----------------------------------------------------
 
 local MountainTab = Window:Tab({ Title = "Mining Gunung", Icon = "pickaxe" })
+
+MountainTab:Toggle({
+    Title = "🔮 Boulders Highlight (Chams Only)",
+    Value = false,
+    Callback = function(state)
+        voltiteHighlightEnabled = state
+        if not state then
+            ClearVoltiteHighlight()
+        end
+    end
+})
 
 MountainTab:Toggle({
     Title = "⚡ Instant Fire Prompt",
