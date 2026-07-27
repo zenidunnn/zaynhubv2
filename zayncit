@@ -5,6 +5,7 @@
     + Boulders Highlight Filter & Force Transparency = 0
     + Custom Keybind Toggle Menu UI & Auto Clicker
     + Dedicated Miscellaneous Tab.
+    + Clean Checkpoint Slot Indicator
 ]]
 
 local Players = game:GetService("Players")
@@ -551,13 +552,33 @@ end
 _G.AdminPanelStopNoclip = stopNoclip
 
 ----------------------------------------------------
--- CHECKPOINT
+-- CHECKPOINT LOGIC & VISUALS
 ----------------------------------------------------
+
+local SlotStatusLabels = {}
+
+local function updateSlotUI(slot)
+    if not SlotStatusLabels[slot] then return end
+    
+    if CheckpointSlots[slot] then
+        local pos = CheckpointSlots[slot].Position
+        local posText = string.format("X: %.1f | Y: %.1f | Z: %.1f", pos.X, pos.Y, pos.Z)
+        SlotStatusLabels[slot]:SetTitle("🟢 Slot " .. slot)
+        SlotStatusLabels[slot]:SetDesc("📍 Lokasi: " .. posText)
+    else
+        SlotStatusLabels[slot]:SetTitle("🔴 Slot " .. slot)
+        SlotStatusLabels[slot]:SetDesc("Belum ada koordinat yang disimpan.")
+    end
+end
 
 local function saveCheckpoint(slot)
     local character = LocalPlayer.Character
     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-    if rootPart then CheckpointSlots[slot] = rootPart.CFrame return true end
+    if rootPart then 
+        CheckpointSlots[slot] = rootPart.CFrame
+        updateSlotUI(slot)
+        return true 
+    end
     return false
 end
 
@@ -574,6 +595,7 @@ end
 local function deleteCheckpoint(slot)
     CheckpointSlots[slot] = nil
     if AutoTeleportSlot == slot then AutoTeleportSlot = nil AutoTeleportOnRespawn = false end
+    updateSlotUI(slot)
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(character)
@@ -787,35 +809,50 @@ MainTab:Toggle({
 })
 
 ----------------------------------------------------
--- CHECKPOINT TAB
+-- CHECKPOINT TAB (CLEAN VERSION)
 ----------------------------------------------------
 
 local CheckpointTab = Window:Tab({ Title = "Checkpoint", Icon = "map-pin" })
 
 for i = 1, 3 do
+    CheckpointTab:Section({ Title = "── Slot " .. i .. " ──" })
+
+    -- Display Indikator Status Slot
+    SlotStatusLabels[i] = CheckpointTab:Paragraph({
+        Title = "🔴 Slot " .. i,
+        Desc = "Belum ada koordinat yang disimpan."
+    })
+
+    -- Tombol-tombol Aksi Slot
     CheckpointTab:Button({
         Title = "💾 Save Slot " .. i,
         Callback = function()
             if saveCheckpoint(i) then
-                WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " tersimpan!", Duration = 3 })
+                WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " berhasil disimpan!", Duration = 3 })
             end
         end
     })
+
     CheckpointTab:Button({
         Title = "➡️ Teleport ke Slot " .. i,
-        Callback = function() teleportToCheckpoint(i) end
+        Callback = function()
+            teleportToCheckpoint(i)
+        end
     })
+
     CheckpointTab:Button({
         Title = "🗑️ Hapus Slot " .. i,
         Callback = function()
             deleteCheckpoint(i)
-            WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " dihapus.", Duration = 3 })
+            WindUI:Notify({ Title = "Checkpoint", Content = "Slot " .. i .. " berhasil dihapus.", Duration = 3 })
         end
     })
 end
 
+CheckpointTab:Section({ Title = "── Pengaturan Respawn ──" })
+
 registerDropdown(CheckpointTab:Dropdown({
-    Title = "Slot untuk Auto TP Saat Respawn",
+    Title = "Slot Auto TP Saat Respawn",
     Values = {"None", "Slot 1", "Slot 2", "Slot 3"},
     Value = "None",
     Callback = function(choice)
@@ -1003,7 +1040,7 @@ MountainTab:Toggle({
 })
 
 ----------------------------------------------------
--- MISCELLANEOUS TAB (TAB BARU)
+-- MISCELLANEOUS TAB
 ----------------------------------------------------
 
 local MiscTab = Window:Tab({ Title = "Miscellaneous", Icon = "list" })
