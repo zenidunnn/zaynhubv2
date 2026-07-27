@@ -2,7 +2,8 @@
     ZAYN PANEL — Full WindUI Version
     Porting lengkap dari Rayfield Panel ke WindUI dengan seluruh fitur
     (Movement, Checkpoint, Players, Mining Gunung, Developer, Info)
-    + Boulders Highlight Filter & Force Transparency = 0.
+    + Boulders Highlight Filter & Force Transparency = 0
+    + Custom Keybind Toggle Menu UI.
 ]]
 
 local Players = game:GetService("Players")
@@ -89,7 +90,7 @@ WindUI:Notify({
 })
 
 ----------------------------------------------------
--- TOGGLE PANEL KEYBIND (R) & DROPDOWN PROTECT
+-- TOGGLE PANEL KEYBIND & DROPDOWN PROTECT
 ----------------------------------------------------
 
 local AllDropdowns = {}
@@ -127,7 +128,7 @@ local ToggleUIKeybind = Enum.KeyCode.R
 track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
     if gameProcessedEvent then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-    if input.KeyCode == ToggleUIKeybind then
+    if ToggleUIKeybind and input.KeyCode == ToggleUIKeybind then
         toggleWindowVisibility()
     end
 end))
@@ -675,6 +676,17 @@ local MainTab = Window:Tab({ Title = "Main", Icon = "house" })
 
 local KEY_OPTIONS = {"None", "F", "G", "R", "T", "Y", "Z", "X", "C", "V", "B"}
 
+-- Keybind untuk Buka/Tutup Menu GUI
+registerDropdown(MainTab:Dropdown({
+    Title = "Toggle UI Keybind",
+    Values = KEY_OPTIONS,
+    Value = "R",
+    Callback = function(keyName)
+        ToggleUIKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+}))
+
+-- Keybind Terbang (Fly)
 registerDropdown(MainTab:Dropdown({
     Title = "Fly Keybind",
     Values = KEY_OPTIONS,
