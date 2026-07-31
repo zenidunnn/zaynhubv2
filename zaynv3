@@ -1,11 +1,8 @@
 --[[
-    ZAYN PANEL — Full WindUI Version
-    Porting lengkap dari Rayfield Panel ke WindUI dengan seluruh fitur
-    (Movement, Checkpoint, Players, Mining Gunung, Miscellaneous, Developer, Info)
-    + Boulders Highlight Filter & Force Transparency = 0
-    + Custom Keybind Toggle Menu UI & Auto Clicker
-    + Dedicated Miscellaneous Tab.
-    + Clean Checkpoint Slot Indicator
+    ZAYN PANEL — Full WindUI Version (FPS & Performance Optimized)
+    + Universal Auto Pick Up (Default Keybind: G)
+    + Custom Keybinds: Fly (F | Speed 120), Turbo Dig (V), Boulders ESP (C), Combo Dig+Aim (X)
+    + Boulders ESP dengan Name Tags / Label Nama
 ]]
 
 local Players = game:GetService("Players")
@@ -14,6 +11,8 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -49,32 +48,402 @@ _G.AdminPanelCleanup = function()
     pcall(function()
         local oldWindow = _G.AdminPanelWindow
         if oldWindow then
-            local closed = pcall(function() oldWindow:Destroy() end)
-            if not closed then closed = pcall(function() oldWindow:Close() end) end
-            if not closed then closed = pcall(function() oldWindow:Unload() end) end
-        end
-    end)
-
-    pcall(function()
-        local containers = { game:GetService("CoreGui") }
-        if LocalPlayer:FindFirstChild("PlayerGui") then
-            table.insert(containers, LocalPlayer.PlayerGui)
-        end
-        for _, container in ipairs(containers) do
-            for _, gui in ipairs(container:GetChildren()) do
-                if gui:IsA("ScreenGui") and gui.Name:lower():find("windui") then
-                    gui:Destroy()
-                end
-            end
+            pcall(function() oldWindow:Destroy() end)
         end
     end)
 end
 
 ----------------------------------------------------
--- WINDUI SETUP
+-- SAFE REMOTES LOADER
 ----------------------------------------------------
 
-local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+local RemotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
+
+local function getRemote(name)
+    if RemotesFolder then
+        return RemotesFolder:FindFirstChild(name)
+    end
+    return nil
+end
+
+local HoldComplete = getRemote("CrystalHoldComplete")
+local DigEvent = getRemote("DigRequest")
+
+task.spawn(function()
+    if not RemotesFolder then
+        RemotesFolder = ReplicatedStorage:WaitForChild("Remotes", 5)
+        if RemotesFolder then
+            HoldComplete = RemotesFolder:FindFirstChild("CrystalHoldComplete")
+            DigEvent = RemotesFolder:FindFirstChild("DigRequest")
+        end
+    end
+end)
+
+----------------------------------------------------
+-- HELPER & OPTIMIZED BACKPACK TRACKER
+----------------------------------------------------
+
+local PICK = {
+    range = 18,
+    cooldown = 0.1,
+    restore = 0.2,
+    burst = 5,
+    retry = 0.2,
+    forget = 4,
+    pad = 3,
+}
+
+local CONTAINER_NAMES = { "DroppedCrystals", "Crystals", "Items", "Drops", "SpawnedItems" }
+local rootPart = nil
+
+local function bindCharacter(character)
+    if not character then rootPart = nil return end
+    rootPart = character:FindFirstChild("HumanoidRootPart")
+end
+
+bindCharacter(LocalPlayer.Character)
+track(LocalPlayer.CharacterAdded:Connect(function(character)
+    rootPart = nil
+    task.wait(0.5)
+    bindCharacter(character)
+end))
+
+local function getRoot()
+    if rootPart and rootPart.Parent then return rootPart end
+    bindCharacter(LocalPlayer.Character)
+    return rootPart
+end
+
+local function getAttr(inst, name)
+    local ok, value = pcall(inst.GetAttribute, inst, name)
+    return ok and value or nil
+end
+
+local function ownsGamepass(name)
+    local folder = LocalPlayer:FindFirstChild("GamepassesOwned")
+    if not folder then return false end
+    local flag = folder:FindFirstChild(name)
+    return flag ~= nil and flag:IsA("BoolValue") and flag.Value == true
+end
+
+local function realStat(name)
+    local data = LocalPlayer:FindFirstChild("PlayerData")
+    local stats = data and data:FindFirstChild("RealStats")
+    local entry = stats and stats:FindFirstChild(name)
+    if not entry then return nil end
+    return tonumber(entry.Value)
+end
+
+local function backpackCapacity()
+    if LocalPlayer:GetAttribute("InfBackpack") == true then return math.huge end
+    local base = realStat("CarryWeight") or 10
+    if ownsGamepass("CarryKgPlus4") then base *= 4 end
+    local total = base + (realStat("CarryWeightBonus") or 0)
+    return total
+end
+
+local function backpackWeight()
+    local total = 0
+    local function scan(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Tool") and getAttr(child, "Tier") ~= nil then
+                local kg = tonumber(getAttr(child, "WeightKg"))
+                if kg then total += kg end
+            end
+        end
+    end
+    scan(LocalPlayer:FindFirstChildOfClass("Backpack"))
+    scan(LocalPlayer.Character)
+    return total
+end
+
+local function backpackFree()
+    local capacity = backpackCapacity()
+    if capacity == math.huge then return math.huge end
+    return capacity - backpackWeight()
+end
+
+local function isValidPickable(inst)
+    if not inst or not inst.Parent then return false end
+    if inst:IsDescendantOf(LocalPlayer.Character) then return false end
+
+    if getAttr(inst, "Collected") == true or getAttr(inst, "Picked") == true then 
+        return false 
+    end
+
+    local prompt = inst:FindFirstChildOfClass("ProximityPrompt")
+    local detector = inst:FindFirstChildOfClass("ClickDetector")
+
+    if prompt or detector then
+        return true
+    end
+
+    if inst:IsA("BasePart") then
+        local attributes = inst:GetAttributes()
+        if next(attributes) ~= nil then
+            return true
+        end
+    end
+
+    return false
+end
+
+local containerList = {}
+local containerClock = 0
+
+local function rebuildContainers()
+    table.clear(containerList)
+    local seen = {}
+    local function push(container)
+        if not container or seen[container] then return end
+        seen[container] = true
+        containerList[#containerList + 1] = container
+    end
+    push(Workspace)
+    for _, name in ipairs(CONTAINER_NAMES) do push(Workspace:FindFirstChild(name)) end
+    local things = Workspace:FindFirstChild("Things")
+    if things then
+        for _, name in ipairs(CONTAINER_NAMES) do push(things:FindFirstChild(name)) end
+    end
+end
+
+local function eachContainer(fn)
+    local now = os.clock()
+    if #containerList == 0 or now - containerClock >= 2 then
+        containerClock = now
+        rebuildContainers()
+    end
+    for _, container in ipairs(containerList) do fn(container) end
+end
+
+----------------------------------------------------
+-- AUTO PICKUP ENGINE
+----------------------------------------------------
+
+local pendingActions = {}
+local promptRestores = {}
+local claimed = {}
+local promptCache = setmetatable({}, { __mode = "k" })
+
+local function schedule(delay, fn)
+    table.insert(pendingActions, { at = os.clock() + delay, fn = fn })
+end
+
+local function itemPrompt(inst)
+    local cached = promptCache[inst]
+    if cached and cached.Parent then return cached end
+    local prompt = inst:FindFirstChildOfClass("ProximityPrompt")
+    if prompt then
+        promptCache[inst] = prompt
+        return prompt
+    end
+    promptCache[inst] = nil
+    return nil
+end
+
+local function surfaceDistance(part, origin)
+    if part:IsA("Model") then
+        local pos = part.PrimaryPart and part.PrimaryPart.Position or part:GetPivot().Position
+        return (pos - origin).Magnitude
+    end
+    return (part.Position - origin).Magnitude
+end
+
+local function firePrompt(prompt)
+    if not prompt or not prompt.Parent then return false end
+    if not promptRestores[prompt] then
+        promptRestores[prompt] = {
+            hold = prompt.HoldDuration,
+            sight = prompt.RequiresLineOfSight,
+            enabled = prompt.Enabled,
+            range = prompt.MaxActivationDistance,
+        }
+    end
+
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.RequiresLineOfSight = false
+        prompt.Enabled = true
+        prompt.MaxActivationDistance = 1000
+    end)
+
+    local fired = false
+    if typeof(fireproximityprompt) == "function" then
+        fired = pcall(fireproximityprompt, prompt, 1)
+        if not fired then fired = pcall(fireproximityprompt, prompt) end
+    end
+
+    if not fired then
+        pcall(function()
+            prompt:InputHoldBegin()
+            prompt:InputHoldEnd()
+        end)
+    end
+
+    schedule(PICK.restore, function()
+        local saved = promptRestores[prompt]
+        if saved and prompt.Parent then
+            prompt.HoldDuration = saved.hold
+            prompt.RequiresLineOfSight = saved.sight
+            prompt.Enabled = saved.enabled
+            prompt.MaxActivationDistance = saved.range
+        end
+        promptRestores[prompt] = nil
+    end)
+
+    return fired
+end
+
+local pickupParams = OverlapParams.new()
+pickupParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local pickupFound = {}
+local pickupSeen = {}
+
+local function pickupCandidates(free, origin)
+    local found = pickupFound
+    local seen = pickupSeen
+    table.clear(found)
+    table.clear(seen)
+    local now = os.clock()
+
+    local function consider(child)
+        if not child or seen[child] then return end
+        seen[child] = true
+
+        if not child.Parent or not isValidPickable(child) then return end
+
+        local claim = claimed[child]
+        if claim and now - claim < PICK.retry then return end
+
+        local weight = tonumber(getAttr(child, "WeightKg")) or 0
+        if weight > free and free ~= math.huge then return end
+
+        local distance = surfaceDistance(child, origin)
+        if distance > PICK.range then return end
+
+        found[#found + 1] = {
+            inst = child,
+            prompt = itemPrompt(child),
+            weight = weight,
+            distance = distance,
+        }
+    end
+
+    pickupParams.FilterDescendantsInstances = { LocalPlayer.Character or LocalPlayer }
+
+    local ok, hits = pcall(function()
+        return Workspace:GetPartBoundsInRadius(origin, PICK.range + PICK.pad, pickupParams)
+    end)
+
+    if ok and hits then
+        for _, part in ipairs(hits) do 
+            consider(part) 
+            if part.Parent and part.Parent:IsA("Model") then
+                consider(part.Parent)
+            end
+        end
+    end
+
+    table.sort(found, function(a, b)
+        return a.distance < b.distance
+    end)
+
+    return found
+end
+
+local function grabItem(inst, prompt)
+    local sent = false
+
+    if HoldComplete then
+        sent = pcall(function() HoldComplete:FireServer(inst) end)
+    end
+
+    if not prompt then prompt = itemPrompt(inst) end
+
+    if prompt and prompt.Parent and firePrompt(prompt) then sent = true end
+
+    if not sent and typeof(fireclickdetector) == "function" then
+        local detector = inst:FindFirstChildOfClass("ClickDetector")
+        if detector then sent = pcall(fireclickdetector, detector, 0) end
+    end
+
+    return sent
+end
+
+local autoPickupActive = false
+local autoPickupKeybind = Enum.KeyCode.G -- DEFAULT KEYBIND 'G'
+local AutoPickupToggleRef = nil
+local lastPickup = 0
+
+local function pickupStep()
+    local now = os.clock()
+    if now - lastPickup < PICK.cooldown then return end
+
+    local root = getRoot()
+    if not root then return end
+
+    local free = backpackFree()
+    if free <= 0 then return end
+
+    for inst, stamp in pairs(claimed) do
+        if now - stamp >= PICK.forget or not inst.Parent then claimed[inst] = nil end
+    end
+
+    local candidates = pickupCandidates(free, root.Position)
+    if #candidates == 0 then return end
+
+    local budget = free
+    local grabs = 0
+
+    for _, entry in ipairs(candidates) do
+        if grabs >= PICK.burst then break end
+        if entry.weight <= budget or budget == math.huge then
+            claimed[entry.inst] = now
+            if grabItem(entry.inst, entry.prompt) then
+                if budget ~= math.huge then budget -= entry.weight end
+                grabs += 1
+            end
+        end
+    end
+
+    if grabs > 0 then lastPickup = now end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(PICK.cooldown)
+        if autoPickupActive then
+            pcall(pickupStep)
+        end
+
+        if #pendingActions > 0 then
+            local now = os.clock()
+            for index = #pendingActions, 1, -1 do
+                local job = pendingActions[index]
+                if now >= job.at then
+                    table.remove(pendingActions, index)
+                    pcall(job.fn)
+                end
+            end
+        end
+    end
+end)
+
+----------------------------------------------------
+-- LOAD WINDUI
+----------------------------------------------------
+
+local WindUISuccess, WindUI = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+end)
+
+if not WindUISuccess or not WindUI then
+    warn("Gagal memuat WindUI Library")
+    return
+end
+
 _G.AdminPanelWindUI = WindUI
 
 local Window = WindUI:CreateWindow({
@@ -85,70 +454,17 @@ local Window = WindUI:CreateWindow({
 })
 _G.AdminPanelWindow = Window
 
-WindUI:Notify({
-    Title = "Admin Panel",
-    Content = "GUI Loaded Successfully!",
-    Duration = 5,
-})
-
 ----------------------------------------------------
--- TOGGLE PANEL KEYBIND & DROPDOWN PROTECT
+-- STATE & ORIGINAL ZAYN PANEL FEATURES
 ----------------------------------------------------
-
-local AllDropdowns = {}
-local function registerDropdown(dropdown)
-    table.insert(AllDropdowns, dropdown)
-    return dropdown
-end
-
-local function closeAllDropdowns()
-    for _, dropdown in ipairs(AllDropdowns) do
-        pcall(function() dropdown:Close() end)
-    end
-end
-
-local function toggleWindowVisibility()
-    closeAllDropdowns()
-
-    local ok = pcall(function() Window:Toggle() end)
-    if not ok then
-        ok = pcall(function() Window:ToggleVisibility() end)
-    end
-    if not ok then
-        pcall(function()
-            if Window.Visible then
-                Window:Close()
-            else
-                Window:Open()
-            end
-        end)
-    end
-end
-
-local ToggleUIKeybind = Enum.KeyCode.R
-
-track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
-    if gameProcessedEvent then return end
-    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-    if ToggleUIKeybind and input.KeyCode == ToggleUIKeybind then
-        toggleWindowVisibility()
-    end
-end))
-
-----------------------------------------------------
--- STATE & REMOTES
-----------------------------------------------------
-
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 2)
-local DigEvent = Remotes and Remotes:WaitForChild("DigRequest", 2) or nil
 
 local FlyEnabled = false
-local FlySpeed = 50
+local FlySpeed = 120 -- DEFAULT SPEED 120
 local WalkSpeedValue = 16
 local JumpPowerValue = 50
 local InfiniteJumpEnabled = false
 local NoclipEnabled = false
-local FlyKeybind = nil
+local FlyKeybind = Enum.KeyCode.F -- DEFAULT KEYBIND 'F'
 local CheckpointSlots = {}
 local AutoTeleportOnRespawn = false
 local AutoTeleportSlot = nil
@@ -162,7 +478,7 @@ local NoclipConnection = nil
 
 -- Fitur Ultra Auto Clicker
 local autoClickerEnabled = false
-local autoClickerClicksPerFrame = 5
+local autoClickerClicksPerFrame = 2
 local autoClickerLoop = nil
 local autoClickerKeybind = nil
 local AutoClickerToggleRef = nil
@@ -170,23 +486,26 @@ local AutoClickerToggleRef = nil
 -- Fitur Mining
 local turboDigEnabled = false
 local turboDigLoop = nil
+local turboDigKeybind = Enum.KeyCode.V -- DEFAULT KEYBIND 'V'
+local TurboDigToggleRef = nil
+
 local autoAimBoulder = false
 local autoDigNoClick = false
-local instantPromptEnabled = false
-local autoCollectEnabled = false
-local autoCollectLoop = nil
-local autoCollectKeybind = nil
-local AutoCollectToggleRef = nil
+local comboDigAimKeybind = Enum.KeyCode.X -- DEFAULT COMBO KEYBIND 'X'
+local ComboToggleRef = nil
+local AutoAimToggleRef = nil
+local AutoDigToggleRef = nil
 
--- Fitur Boulder Highlight
+local instantPromptEnabled = false
+
+-- Fitur Boulder Highlight & ESP Name
 local voltiteHighlightEnabled = false
 local voltiteHighlightCache = {}
-local voltiteRenderLoop = nil
-
-local MaxCollectDistance = 12
+local voltiteKeybind = Enum.KeyCode.C -- DEFAULT KEYBIND 'C'
+local VoltiteToggleRef = nil
 
 ----------------------------------------------------
--- HELPER FUNCTIONS
+-- HELPER FUNCTIONS ORIGINAL
 ----------------------------------------------------
 
 local function getCharacterParts()
@@ -222,6 +541,49 @@ local function GetNearestBoulderPosition()
 end
 
 ----------------------------------------------------
+-- TURBO DIG TOGGLE FUNCTION
+----------------------------------------------------
+
+local function setTurboDig(state)
+    turboDigEnabled = state
+    if TurboDigToggleRef and TurboDigToggleRef.Set then
+        TurboDigToggleRef:Set(state)
+    end
+
+    if turboDigLoop then
+        task.cancel(turboDigLoop)
+        turboDigLoop = nil
+    end
+
+    if turboDigEnabled and DigEvent then
+        local fastEvent = DigEvent
+        local fastMouse = LocalPlayer:GetMouse()
+        local fastUis = UserInputService
+        local localPlayer = LocalPlayer
+        local mouseLeft = Enum.UserInputType.MouseButton1
+
+        turboDigLoop = task.spawn(function()
+            while turboDigEnabled do
+                task.wait(0.08)
+                if autoDigNoClick or fastUis:IsMouseButtonPressed(mouseLeft) then
+                    local character = localPlayer.Character
+                    local currentTool = character and character:FindFirstChildOfClass("Tool")
+
+                    if not (autoDigNoClick and not currentTool) then
+                        local dynamicItemName = currentTool and currentTool.Name or "Celestial Apex"
+                        local targetPos = autoAimBoulder and GetNearestBoulderPosition() or (fastMouse.Hit and fastMouse.Hit.Position)
+
+                        if targetPos then
+                            fastEvent:FireServer(dynamicItemName, targetPos)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end
+
+----------------------------------------------------
 -- ULTRA AUTO CLICKER LOGIC
 ----------------------------------------------------
 
@@ -229,18 +591,21 @@ local function toggleAutoClicker(state)
     autoClickerEnabled = state
 
     if autoClickerLoop then
-        autoClickerLoop:Disconnect()
+        task.cancel(autoClickerLoop)
         autoClickerLoop = nil
     end
 
     if autoClickerEnabled then
-        autoClickerLoop = track(RunService.RenderStepped:Connect(function()
-            local mousePos = UserInputService:GetMouseLocation()
-            for i = 1, autoClickerClicksPerFrame do
-                VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, true, game, 1)
-                VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, false, game, 1)
+        autoClickerLoop = task.spawn(function()
+            while autoClickerEnabled do
+                task.wait(0.05)
+                local mousePos = UserInputService:GetMouseLocation()
+                for i = 1, autoClickerClicksPerFrame do
+                    VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, true, game, 1)
+                    VirtualInputManager:SendMouseButtonEvent(mousePos.X, mousePos.Y, 0, false, game, 1)
+                end
             end
-        end))
+        end)
     end
 end
 
@@ -248,25 +613,16 @@ _G.AdminPanelStopAutoClicker = function()
     toggleAutoClicker(false)
 end
 
-track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
-    if gameProcessedEvent then return end
-    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-    if autoClickerKeybind and input.KeyCode == autoClickerKeybind then
-        local newState = not autoClickerEnabled
-        toggleAutoClicker(newState)
-        if AutoClickerToggleRef and AutoClickerToggleRef.Set then
-            AutoClickerToggleRef:Set(newState)
-        end
-    end
-end))
-
 ----------------------------------------------------
--- BOULDERS HIGHLIGHT
+-- BOULDERS HIGHLIGHT & NAME TAG ESP
 ----------------------------------------------------
 
 local function ClearVoltiteHighlight()
-    for obj, hl in pairs(voltiteHighlightCache) do
-        pcall(function() hl:Destroy() end)
+    for obj, cache in pairs(voltiteHighlightCache) do
+        pcall(function()
+            if cache.Highlight then cache.Highlight:Destroy() end
+            if cache.Billboard then cache.Billboard:Destroy() end
+        end)
     end
     table.clear(voltiteHighlightCache)
 end
@@ -274,136 +630,91 @@ _G.AdminPanelClearBoulders = ClearVoltiteHighlight
 
 local function ForceMakeBoulderVisible(boulder)
     if not boulder then return end
-
     if boulder:IsA("BasePart") then
         boulder.Transparency = 0
     elseif boulder:IsA("Model") then
         for _, child in ipairs(boulder:GetDescendants()) do
-            if child:IsA("BasePart") then
-                child.Transparency = 0
-            end
+            if child:IsA("BasePart") then child.Transparency = 0 end
         end
     end
 end
 
-voltiteRenderLoop = track(RunService.Heartbeat:Connect(function()
-    if not voltiteHighlightEnabled then return end
-    
-    local success, err = pcall(function()
-        local targetPath = workspace:FindFirstChild("MountainDecorations")
-        targetPath = targetPath and targetPath:FindFirstChild("Boulders")
-        
-        if not targetPath then 
-            ClearVoltiteHighlight()
-            return 
-        end
-        
-        local allBoulders = targetPath:GetChildren()
-        local activeObjects = {}
-        
-        for _, obj in ipairs(allBoulders) do
-            if obj:IsA("Model") or obj:IsA("BasePart") then
-                ForceMakeBoulderVisible(obj)
-
-                activeObjects[obj] = true
-
-                if not voltiteHighlightCache[obj] then
-                    local hl = Instance.new("Highlight")
-                    hl.Name = "BouldersHighlight"
-                    hl.Adornee = obj
-                    
-                    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-
-                    hl.FillColor = Color3.fromRGB(0, 255, 255)
-                    hl.FillTransparency = 0.35
-                    hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-                    hl.OutlineTransparency = 0
-
-                    hl.Parent = game:GetService("CoreGui")
-
-                    voltiteHighlightCache[obj] = hl
-                end
-            end
-        end
-
-        for obj, hl in pairs(voltiteHighlightCache) do
-            if not activeObjects[obj] or not obj.Parent then
-                pcall(function() hl:Destroy() end)
-                voltiteHighlightCache[obj] = nil
-            end
-        end
-    end)
-    
-    if not success then
-        ClearVoltiteHighlight()
-    end
-end))
-
-----------------------------------------------------
--- INSTANT PROMPT & AUTO COLLECT LOGIC
-----------------------------------------------------
-
-local function triggerPrompt(prompt)
-    if not prompt or not prompt.Enabled then return end
-    
-    local character = LocalPlayer.Character
-    local hrp = character and character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-
-    local parentPart = prompt.Parent
-    local promptPos = parentPart and (parentPart:IsA("BasePart") and parentPart.Position or parentPart:IsA("Model") and parentPart:GetPivot().Position)
-
-    if promptPos then
-        local distance = (hrp.Position - promptPos).Magnitude
-        if distance <= MaxCollectDistance then
-            prompt.HoldDuration = 0
-            if fireproximityprompt then
-                fireproximityprompt(prompt)
-            else
-                pcall(function()
-                    prompt:InputHoldBegan()
-                    prompt:InputHoldEnd()
-                end)
-            end
-        end
-    end
-end
-
-local function toggleAutoCollect(state)
-    autoCollectEnabled = state
-
-    if autoCollectLoop then
-        autoCollectLoop:Disconnect()
-        autoCollectLoop = nil
-    end
-
-    if autoCollectEnabled then
-        autoCollectLoop = track(RunService.Heartbeat:Connect(function()
-            local character = LocalPlayer.Character
-            local hrp = character and character:FindFirstChild("HumanoidRootPart")
-            if not hrp then return end
-
-            local overlapParams = OverlapParams.new()
-            overlapParams.FilterType = Enum.RaycastFilterType.Include
-            overlapParams.FilterDescendantsInstances = {workspace}
-
-            local nearbyParts = workspace:GetPartBoundsInRadius(hrp.Position, MaxCollectDistance, overlapParams)
-
-            for _, part in ipairs(nearbyParts) do
-                if not autoCollectEnabled then break end
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if voltiteHighlightEnabled then
+            pcall(function()
+                local targetPath = workspace:FindFirstChild("MountainDecorations")
+                targetPath = targetPath and targetPath:FindFirstChild("Boulders")
                 
-                for _, child in ipairs(part:GetChildren()) do
-                    if child:IsA("ProximityPrompt") and child.Enabled then
-                        triggerPrompt(child)
+                if not targetPath then 
+                    ClearVoltiteHighlight()
+                    return 
+                end
+                
+                local allBoulders = targetPath:GetChildren()
+                local activeObjects = {}
+                
+                for _, obj in ipairs(allBoulders) do
+                    if obj:IsA("Model") or obj:IsA("BasePart") then
+                        ForceMakeBoulderVisible(obj)
+                        activeObjects[obj] = true
+
+                        if not voltiteHighlightCache[obj] then
+                            local hl = Instance.new("Highlight")
+                            hl.Name = "BouldersHighlight"
+                            hl.Adornee = obj
+                            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                            hl.FillColor = Color3.fromRGB(0, 255, 255)
+                            hl.FillTransparency = 0.35
+                            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                            hl.OutlineTransparency = 0
+                            hl.Parent = CoreGui
+
+                            local bb = Instance.new("BillboardGui")
+                            bb.Name = "BoulderNameTag"
+                            bb.Adornee = obj
+                            bb.Size = UDim2.new(0, 120, 0, 25)
+                            bb.StudsOffset = Vector3.new(0, 3, 0)
+                            bb.AlwaysOnTop = true
+                            bb.Parent = CoreGui
+
+                            local txt = Instance.new("TextLabel")
+                            txt.Size = UDim2.new(1, 0, 1, 0)
+                            txt.BackgroundTransparency = 1
+                            txt.Text = "🪨 " .. obj.Name
+                            txt.TextColor3 = Color3.fromRGB(0, 255, 255)
+                            txt.TextStrokeTransparency = 0
+                            txt.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                            txt.Font = Enum.Font.GothamBold
+                            txt.TextSize = 12
+                            txt.Parent = bb
+
+                            voltiteHighlightCache[obj] = { Highlight = hl, Billboard = bb }
+                        end
                     end
                 end
-            end
-        end))
+
+                for obj, cache in pairs(voltiteHighlightCache) do
+                    if not activeObjects[obj] or not obj.Parent then
+                        pcall(function()
+                            if cache.Highlight then cache.Highlight:Destroy() end
+                            if cache.Billboard then cache.Billboard:Destroy() end
+                        end)
+                        voltiteHighlightCache[obj] = nil
+                    end
+                end
+            end)
+        end
     end
-end
+end)
+
+----------------------------------------------------
+-- INSTANT PROMPT LOGIC
+----------------------------------------------------
 
 track(ProximityPromptService.PromptShown:Connect(function(prompt)
-    if instantPromptEnabled or autoCollectEnabled then
+    if instantPromptEnabled then
         local character = LocalPlayer.Character
         local hrp = character and character:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
@@ -411,30 +722,14 @@ track(ProximityPromptService.PromptShown:Connect(function(prompt)
         local parentPart = prompt.Parent
         local promptPos = parentPart and (parentPart:IsA("BasePart") and parentPart.Position or parentPart:IsA("Model") and parentPart:GetPivot().Position)
 
-        if promptPos and (hrp.Position - promptPos).Magnitude <= MaxCollectDistance then
+        if promptPos and (hrp.Position - promptPos).Magnitude <= 12 then
             prompt.HoldDuration = 0
-            if autoCollectEnabled then
-                triggerPrompt(prompt)
-            end
         end
     end
 end))
 
 track(ProximityPromptService.PromptButtonHoldBegan:Connect(function(prompt)
-    if instantPromptEnabled or autoCollectEnabled then pcall(function() prompt:InputHoldEnd() end) end
-end))
-
-track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
-    if gameProcessedEvent then return end
-    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-    
-    if autoCollectKeybind and input.KeyCode == autoCollectKeybind then
-        local newState = not autoCollectEnabled
-        toggleAutoCollect(newState)
-        if AutoCollectToggleRef and AutoCollectToggleRef.Set then 
-            AutoCollectToggleRef:Set(newState) 
-        end
-    end
+    if instantPromptEnabled then pcall(function() prompt:InputHoldEnd() end) end
 end))
 
 ----------------------------------------------------
@@ -624,7 +919,7 @@ local function createESP(player)
     highlight.Parent = character
 
     local head = character:FindFirstChild("Head")
-    local billboard, renderConnection
+    local billboard
 
     if head then
         billboard = Instance.new("BillboardGui")
@@ -677,26 +972,29 @@ local function createESP(player)
         infoLabel.Text = "0m · Alt: 0m"
         infoLabel.Parent = frame
 
-        renderConnection = RunService.RenderStepped:Connect(function()
-            local myChar = LocalPlayer.Character
-            local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
-            local targetHrp = character and character:FindFirstChild("HumanoidRootPart")
+        local espTask = task.spawn(function()
+            while ESPCache[player] do
+                task.wait(0.2)
+                local myChar = LocalPlayer.Character
+                local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                local targetHrp = character and character:FindFirstChild("HumanoidRootPart")
 
-            if myHrp and targetHrp then
-                local distance = math.floor((myHrp.Position - targetHrp.Position).Magnitude)
-                local altitude = math.floor(targetHrp.Position.Y)
-                infoLabel.Text = string.format("%dm  ·  Alt: %dm", distance, altitude)
+                if myHrp and targetHrp then
+                    local distance = math.floor((myHrp.Position - targetHrp.Position).Magnitude)
+                    local altitude = math.floor(targetHrp.Position.Y)
+                    infoLabel.Text = string.format("%dm  ·  Alt: %dm", distance, altitude)
+                end
             end
         end)
     end
 
-    ESPCache[player] = { Highlight = highlight, Billboard = billboard, Connection = renderConnection }
+    ESPCache[player] = { Highlight = highlight, Billboard = billboard, Task = espTask }
 end
 
 local function removeESP(player)
     local cache = ESPCache[player]
     if cache then
-        if cache.Connection then cache.Connection:Disconnect() end
+        if cache.Task then task.cancel(cache.Task) end
         if cache.Highlight then cache.Highlight:Destroy() end
         if cache.Billboard then cache.Billboard:Destroy() end
         ESPCache[player] = nil
@@ -743,37 +1041,70 @@ local MainTab = Window:Tab({ Title = "Main", Icon = "house" })
 
 local KEY_OPTIONS = {"None", "F", "G", "R", "T", "Y", "Z", "X", "C", "V", "B"}
 
-registerDropdown(MainTab:Dropdown({
+local ToggleUIKeybind = Enum.KeyCode.R
+
+MainTab:Dropdown({
     Title = "Toggle UI Keybind",
     Values = KEY_OPTIONS,
     Value = "R",
     Callback = function(keyName)
         ToggleUIKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
     end
-}))
+})
 
-registerDropdown(MainTab:Dropdown({
+MainTab:Dropdown({
     Title = "Fly Keybind",
     Values = KEY_OPTIONS,
-    Value = "None",
+    Value = "F", -- DEFAULT KEYBIND 'F'
     Callback = function(keyName)
         FlyKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
     end
-}))
+})
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
     if gameProcessedEvent then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    
+    if ToggleUIKeybind and input.KeyCode == ToggleUIKeybind then
+        pcall(function() Window:Toggle() end)
+    end
+    
     if FlyKeybind and input.KeyCode == FlyKeybind then
         FlyEnabled = not FlyEnabled
         if FlyEnabled then startFly() else stopFly() end
+    end
+
+    if autoPickupKeybind and input.KeyCode == autoPickupKeybind then
+        autoPickupActive = not autoPickupActive
+        if AutoPickupToggleRef and AutoPickupToggleRef.Set then 
+            AutoPickupToggleRef:Set(autoPickupActive) 
+        end
+    end
+
+    if turboDigKeybind and input.KeyCode == turboDigKeybind then
+        setTurboDig(not turboDigEnabled)
+    end
+
+    if voltiteKeybind and input.KeyCode == voltiteKeybind then
+        voltiteHighlightEnabled = not voltiteHighlightEnabled
+        if VoltiteToggleRef and VoltiteToggleRef.Set then VoltiteToggleRef:Set(voltiteHighlightEnabled) end
+        if not voltiteHighlightEnabled then ClearVoltiteHighlight() end
+    end
+
+    if comboDigAimKeybind and input.KeyCode == comboDigAimKeybind then
+        local newState = not autoAimBoulder
+        autoAimBoulder = newState
+        autoDigNoClick = newState
+        if AutoAimToggleRef and AutoAimToggleRef.Set then AutoAimToggleRef:Set(newState) end
+        if AutoDigToggleRef and AutoDigToggleRef.Set then AutoDigToggleRef:Set(newState) end
+        if ComboToggleRef and ComboToggleRef.Set then ComboToggleRef:Set(newState) end
     end
 end))
 
 MainTab:Slider({
     Title = "Fly Speed",
     Step = 5,
-    Value = { Min = 10, Max = 1000, Default = FlySpeed },
+    Value = { Min = 10, Max = 1000, Default = 120 }, -- DEFAULT FLY SPEED 120
     Callback = function(v) FlySpeed = v end
 })
 
@@ -809,7 +1140,7 @@ MainTab:Toggle({
 })
 
 ----------------------------------------------------
--- CHECKPOINT TAB (CLEAN VERSION)
+-- CHECKPOINT TAB
 ----------------------------------------------------
 
 local CheckpointTab = Window:Tab({ Title = "Checkpoint", Icon = "map-pin" })
@@ -817,13 +1148,11 @@ local CheckpointTab = Window:Tab({ Title = "Checkpoint", Icon = "map-pin" })
 for i = 1, 3 do
     CheckpointTab:Section({ Title = "── Slot " .. i .. " ──" })
 
-    -- Display Indikator Status Slot
     SlotStatusLabels[i] = CheckpointTab:Paragraph({
         Title = "🔴 Slot " .. i,
         Desc = "Belum ada koordinat yang disimpan."
     })
 
-    -- Tombol-tombol Aksi Slot
     CheckpointTab:Button({
         Title = "💾 Save Slot " .. i,
         Callback = function()
@@ -851,14 +1180,14 @@ end
 
 CheckpointTab:Section({ Title = "── Pengaturan Respawn ──" })
 
-registerDropdown(CheckpointTab:Dropdown({
+CheckpointTab:Dropdown({
     Title = "Slot Auto TP Saat Respawn",
     Values = {"None", "Slot 1", "Slot 2", "Slot 3"},
     Value = "None",
     Callback = function(choice)
         AutoTeleportSlot = (choice == "Slot 1" and 1) or (choice == "Slot 2" and 2) or (choice == "Slot 3" and 3) or nil
     end
-}))
+})
 
 CheckpointTab:Toggle({
     Title = "Auto TP ke Slot Saat Respawn",
@@ -879,11 +1208,11 @@ local function getOtherPlayerNames()
     return names
 end
 
-local PlayerDropdown = registerDropdown(PlayersTab:Dropdown({
+local PlayerDropdown = PlayersTab:Dropdown({
     Title = "Select Player",
     Values = getOtherPlayerNames(),
     Callback = function(name) selectedPlayerName = name end
-}))
+})
 
 PlayersTab:Button({
     Title = "Refresh Player List",
@@ -950,14 +1279,21 @@ PlayersTab:Button({
 
 local MountainTab = Window:Tab({ Title = "Mining Gunung", Icon = "pickaxe" })
 
-MountainTab:Toggle({
-    Title = "🔮 Boulders Highlight (Chams Only)",
+MountainTab:Dropdown({
+    Title = "🔮 Boulders ESP Keybind",
+    Values = KEY_OPTIONS,
+    Value = "C", -- DEFAULT KEYBIND 'C'
+    Callback = function(keyName)
+        voltiteKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+})
+
+VoltiteToggleRef = MountainTab:Toggle({
+    Title = "🔮 Boulders Highlight + Name Tag (ESP)",
     Value = false,
     Callback = function(state)
         voltiteHighlightEnabled = state
-        if not state then
-            ClearVoltiteHighlight()
-        end
+        if not state then ClearVoltiteHighlight() end
     end
 })
 
@@ -969,24 +1305,46 @@ MountainTab:Toggle({
     end
 })
 
-registerDropdown(MountainTab:Dropdown({
-    Title = "⚡ Auto Collect Keybind",
+MountainTab:Dropdown({
+    Title = "🧲 Auto Pick Up Keybind",
     Values = KEY_OPTIONS,
-    Value = "None",
+    Value = "G", -- DEFAULT KEYBIND 'G'
     Callback = function(keyName)
-        autoCollectKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
-    end
-}))
-
-AutoCollectToggleRef = MountainTab:Toggle({
-    Title = "⚡ Fast Auto Collect (Dekat Saja & No Lag)",
-    Value = false,
-    Callback = function(Value)
-        toggleAutoCollect(Value)
+        autoPickupKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
     end
 })
 
-MountainTab:Toggle({
+AutoPickupToggleRef = MountainTab:Toggle({
+    Title = "🧲 Auto Pick Up All Items/Attributes",
+    Value = false,
+    Callback = function(Value)
+        autoPickupActive = Value
+    end
+})
+
+MountainTab:Section({ Title = "── Auto Dig & Auto Aim Settings ──" })
+
+MountainTab:Dropdown({
+    Title = "⚙️ Combo Auto Dig + Aim Keybind",
+    Values = KEY_OPTIONS,
+    Value = "X", -- DEFAULT KEYBIND 'X'
+    Callback = function(keyName)
+        comboDigAimKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+})
+
+ComboToggleRef = MountainTab:Toggle({
+    Title = "⚡ Combo Auto Dig & Auto Aim Boulder (Toggle X)",
+    Value = false,
+    Callback = function(Value)
+        autoAimBoulder = Value
+        autoDigNoClick = Value
+        if AutoAimToggleRef and AutoAimToggleRef.Set then AutoAimToggleRef:Set(Value) end
+        if AutoDigToggleRef and AutoDigToggleRef.Set then AutoDigToggleRef:Set(Value) end
+    end
+})
+
+AutoAimToggleRef = MountainTab:Toggle({
     Title = "🧲 Auto-Aim Nearest Boulder",
     Value = false,
     Callback = function(Value)
@@ -994,7 +1352,7 @@ MountainTab:Toggle({
     end
 })
 
-MountainTab:Toggle({
+AutoDigToggleRef = MountainTab:Toggle({
     Title = "🤖 Auto Dig (No Click Required)",
     Value = false,
     Callback = function(Value)
@@ -1002,40 +1360,20 @@ MountainTab:Toggle({
     end
 })
 
-MountainTab:Toggle({
+MountainTab:Dropdown({
+    Title = "🔥 Turbo Dig Keybind",
+    Values = KEY_OPTIONS,
+    Value = "V", -- DEFAULT KEYBIND 'V'
+    Callback = function(keyName)
+        turboDigKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
+    end
+})
+
+TurboDigToggleRef = MountainTab:Toggle({
     Title = "🔥 Turbo Dig (Master Switch)",
     Value = false,
     Callback = function(Value)
-        turboDigEnabled = Value
-
-        if turboDigLoop then
-            turboDigLoop:Disconnect()
-            turboDigLoop = nil
-        end
-
-        if turboDigEnabled and DigEvent then
-            local fastEvent = DigEvent
-            local fastMouse = LocalPlayer:GetMouse()
-            local fastUis = UserInputService
-            local localPlayer = LocalPlayer
-            local mouseLeft = Enum.UserInputType.MouseButton1
-
-            turboDigLoop = track(RunService.Heartbeat:Connect(function()
-                if autoDigNoClick or fastUis:IsMouseButtonPressed(mouseLeft) then
-                    local character = localPlayer.Character
-                    local currentTool = character and character:FindFirstChildOfClass("Tool")
-
-                    if autoDigNoClick and not currentTool then return end
-
-                    local dynamicItemName = currentTool and currentTool.Name or "Celestial Apex"
-                    local targetPos = autoAimBoulder and GetNearestBoulderPosition() or (fastMouse.Hit and fastMouse.Hit.Position)
-
-                    if targetPos then
-                        fastEvent:FireServer(dynamicItemName, targetPos)
-                    end
-                end
-            end))
-        end
+        setTurboDig(Value)
     end
 })
 
@@ -1045,14 +1383,14 @@ MountainTab:Toggle({
 
 local MiscTab = Window:Tab({ Title = "Miscellaneous", Icon = "list" })
 
-registerDropdown(MiscTab:Dropdown({
+MiscTab:Dropdown({
     Title = "⚡ Auto Clicker Keybind",
     Values = KEY_OPTIONS,
     Value = "None",
     Callback = function(keyName)
         autoClickerKeybind = (keyName == "None" or not keyName) and nil or Enum.KeyCode[keyName]
     end
-}))
+})
 
 AutoClickerToggleRef = MiscTab:Toggle({
     Title = "🖱️ Ultra Auto Clicker",
@@ -1063,9 +1401,9 @@ AutoClickerToggleRef = MiscTab:Toggle({
 })
 
 MiscTab:Slider({
-    Title = "🔥 Clicks Per Frame (Kecepatan Click)",
+    Title = "🔥 Clicks Per Loop",
     Step = 1,
-    Value = { Min = 1, Max = 50, Default = autoClickerClicksPerFrame },
+    Value = { Min = 1, Max = 15, Default = autoClickerClicksPerFrame },
     Callback = function(v)
         autoClickerClicksPerFrame = v
     end
@@ -1091,17 +1429,27 @@ DevTab:Button({
 local InfoTab = Window:Tab({ Title = "Info", Icon = "info" })
 
 InfoTab:Paragraph({ Title = "About", Desc = "Credits : Zayn Scripter Homies" })
-InfoTab:Paragraph({ Title = "Fly Controls", Desc = "W/A/S/D untuk bergerak, Space untuk naik, Left Ctrl untuk turun. Arah terbang mengikuti arah kamera." })
-InfoTab:Paragraph({ Title = "Bug", Desc = "Hati Hati untuk mengaktifkan fitur Pukulan/Tendangan Maut karena suka bug keybindnya tabrakan !" })
+InfoTab:Paragraph({ Title = "Fly Controls", Desc = "W/A/S/D untuk bergerak, Space untuk naik, Left Ctrl untuk turun. Keybind Default: F (Speed: 120)." })
+InfoTab:Paragraph({ Title = "Keybind Mining", Desc = "G: Auto Pickup | V: Turbo Dig | C: Boulders ESP + Name | X: Combo Auto Dig & Aim" })
 InfoTab:Paragraph({ Title = "Zayn Love Livy", Desc = "YANG BIKIN SCRIPT INI UDAH PUNYA CEWE NAMANYA LIVYYYYYYYYYY!!!!!!!!!!!!" })
 
 ----------------------------------------------------
 -- AUTO SELECT TAB MAIN
 ----------------------------------------------------
 
-task.defer(function()
-    local ok = pcall(function() MainTab:Select() end)
-    if not ok then ok = pcall(function() Window:SelectTab(MainTab) end) end
-    if not ok then ok = pcall(function() Window:SetTab(MainTab) end) end
-    if not ok then ok = pcall(function() MainTab:Show() end) end
+task.spawn(function()
+    task.wait(0.15)
+    pcall(function()
+        if MainTab and MainTab.Select then
+            MainTab:Select()
+        elseif Window and Window.SelectTab then
+            Window:SelectTab(1)
+        end
+    end)
 end)
+
+WindUI:Notify({
+    Title = "Zayn Panel",
+    Content = "GUI Loaded Successfully!",
+    Duration = 5,
+})
